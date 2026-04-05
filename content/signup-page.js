@@ -111,7 +111,8 @@ async function step3_fillEmailPassword(payload) {
     }
   }
 
-  fillInput(passwordInput, payload.password || 'mimashisha0.0');
+  if (!payload.password) throw new Error('No password provided. Step 3 requires a generated password.');
+  fillInput(passwordInput, payload.password);
   log('Step 3: Password filled');
 
   // Report complete BEFORE submit, because submit causes page navigation
@@ -265,8 +266,20 @@ async function step8_clickContinue() {
   }
 
   log('Step 8: Found "继续" button, clicking...');
-  simulateClick(continueBtn);
-  log('Step 8: Clicked "继续", redirecting to localhost... (background will capture URL)');
+
+  // Use native .click() — simulateClick (dispatchEvent) may not trigger form submit
+  continueBtn.click();
+  log('Step 8: Clicked via .click()');
+
+  // Also try submitting the form directly as a fallback
+  await sleep(500);
+  const form = continueBtn.closest('form');
+  if (form) {
+    form.requestSubmit(continueBtn);
+    log('Step 8: Also triggered form.requestSubmit()');
+  }
+
+  log('Step 8: Redirecting to localhost... (background will capture URL)');
 
   // Don't reportComplete — background handles it via webNavigation listener
 }

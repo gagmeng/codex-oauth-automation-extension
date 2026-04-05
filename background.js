@@ -39,13 +39,14 @@ async function setState(updates) {
 
 async function resetState() {
   console.log(LOG_PREFIX, 'Resetting all state');
-  // Preserve seenCodes and accounts across resets
-  const prev = await chrome.storage.session.get(['seenCodes', 'accounts']);
+  // Preserve seenCodes, accounts, and tabRegistry across resets
+  const prev = await chrome.storage.session.get(['seenCodes', 'accounts', 'tabRegistry']);
   await chrome.storage.session.clear();
   await chrome.storage.session.set({
     ...DEFAULT_STATE,
     seenCodes: prev.seenCodes || [],
     accounts: prev.accounts || [],
+    tabRegistry: prev.tabRegistry || {},
   });
 }
 
@@ -138,6 +139,61 @@ function flushCommand(source, tabId) {
     chrome.tabs.sendMessage(tabId, pending.message).then(pending.resolve).catch(pending.reject);
     console.log(LOG_PREFIX, `Flushed queued command to ${source} (tab ${tabId})`);
   }
+}
+
+// ============================================================
+// Reuse or create tab
+// ============================================================
+
+async function reuseOrCreateTab(source, url, options = {}) {
+  const alive = await isTabAlive(source);
+  if (alive) {
+    const tabId = await getTabId(source);
+    // Navigate existing tab to new URL (or just activate if same URL)
+    await chrome.tabs.update(tabId, { url, active: true });
+    console.log(LOG_PREFIX, `Reused tab ${source} (${tabId}), navigated to ${url.slice(0, 60)}`);
+
+    // Wait for page load
+    await new Promise(resolve => {
+      const listener = (tid, info) => {
+        if (tid === tabId && info.status === 'complete') {
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }
+      };
+      chrome.tabs.onUpdated.addListener(listener);
+    });
+
+    // Mark as not ready — content script will re-inject and send READY
+    const registry = await getTabRegistry();
+    if (registry[source]) registry[source].ready = false;
+    await setState({ tabRegistry: registry });
+
+    return tabId;
+  }
+
+  // Create new tab
+  const tab = await chrome.tabs.create({ url, active: true });
+  console.log(LOG_PREFIX, `Created new tab ${source} (${tab.id})`);
+
+  // If dynamic injection needed (VPS panel), inject scripts after load
+  if (options.inject) {
+    await new Promise(resolve => {
+      const listener = (tabId, info) => {
+        if (tabId === tab.id && info.status === 'complete') {
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }
+      };
+      chrome.tabs.onUpdated.addListener(listener);
+    });
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: options.inject,
+    });
+  }
+
+  return tab.id;
 }
 
 // ============================================================
@@ -526,35 +582,11 @@ async function resumeAutoRun() {
 // ============================================================
 
 async function executeStep1(state) {
-  const vpsUrl = state.vpsUrl;
-  if (!vpsUrl) {
+  if (!state.vpsUrl) {
     throw new Error('No VPS URL configured. Enter VPS address in Side Panel first.');
   }
-
-  // Ensure VPS panel tab is open
-  const alive = await isTabAlive('vps-panel');
-  if (!alive) {
-    await addLog(`Step 1: Opening VPS panel: ${vpsUrl.slice(0, 60)}...`);
-    const tab = await chrome.tabs.create({ url: vpsUrl, active: true });
-    // Dynamically inject content scripts since VPS URL is configurable
-    // Wait for page to load, then inject
-    await new Promise(resolve => {
-      const listener = (tabId, info) => {
-        if (tabId === tab.id && info.status === 'complete') {
-          chrome.tabs.onUpdated.removeListener(listener);
-          resolve();
-        }
-      };
-      chrome.tabs.onUpdated.addListener(listener);
-    });
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ['content/utils.js', 'content/vps-panel.js'],
-    });
-  } else {
-    const tabId = await getTabId('vps-panel');
-    if (tabId) await chrome.tabs.update(tabId, { active: true });
-  }
+  await addLog(`Step 1: Opening VPS panel...`);
+  await reuseOrCreateTab('vps-panel', state.vpsUrl, { inject: ['content/utils.js', 'content/vps-panel.js'] });
 
   await sendToContentScript('vps-panel', {
     type: 'EXECUTE_STEP',
@@ -572,10 +604,9 @@ async function executeStep2(state) {
   if (!state.oauthUrl) {
     throw new Error('No OAuth URL. Complete step 1 first.');
   }
-  await addLog(`Step 2: Opening auth URL in new tab: ${state.oauthUrl.slice(0, 80)}...`);
-  const tab = await chrome.tabs.create({ url: state.oauthUrl, active: true });
-  // signup-page.js will auto-inject via manifest content_scripts
-  // Queue the command — it will flush when script sends READY signal
+  await addLog(`Step 2: Opening auth URL...`);
+  await reuseOrCreateTab('signup-page', state.oauthUrl);
+
   await sendToContentScript('signup-page', {
     type: 'EXECUTE_STEP',
     step: 2,
@@ -625,14 +656,15 @@ function getMailConfig(state) {
 
 async function executeStep4(state) {
   const mail = getMailConfig(state);
+  await addLog(`Step 4: Opening ${mail.label}...`);
 
+  // For mail tabs, only create if not alive — don't navigate (preserves login session)
   const alive = await isTabAlive(mail.source);
-  if (!alive) {
-    await addLog(`Step 4: Opening ${mail.label}...`);
-    await chrome.tabs.create({ url: mail.url, active: true });
-  } else {
+  if (alive) {
     const tabId = await getTabId(mail.source);
-    if (tabId) await chrome.tabs.update(tabId, { active: true });
+    await chrome.tabs.update(tabId, { active: true });
+  } else {
+    await reuseOrCreateTab(mail.source, mail.url);
   }
 
   const result = await sendToContentScript(mail.source, {
@@ -702,15 +734,9 @@ async function executeStep6(state) {
     throw new Error('No email. Complete step 3 first.');
   }
 
-  // Open the OAuth URL again in a new tab to start the login flow
-  // Close the old signup tab first (it's on add-phone page, not needed)
-  const oldSignupTabId = await getTabId('signup-page');
-  if (oldSignupTabId) {
-    try { await chrome.tabs.remove(oldSignupTabId); } catch {}
-  }
-
-  await addLog(`Step 6: Opening OAuth URL for login: ${state.oauthUrl.slice(0, 60)}...`);
-  await chrome.tabs.create({ url: state.oauthUrl, active: true });
+  await addLog(`Step 6: Opening OAuth URL for login...`);
+  // Reuse the signup-page tab — navigate it to the OAuth URL
+  await reuseOrCreateTab('signup-page', state.oauthUrl);
 
   // signup-page.js will inject (same auth.openai.com domain) and handle login
   await sendToContentScript('signup-page', {
@@ -727,14 +753,14 @@ async function executeStep6(state) {
 
 async function executeStep7(state) {
   const mail = getMailConfig(state);
+  await addLog(`Step 7: Opening ${mail.label}...`);
 
   const alive = await isTabAlive(mail.source);
-  if (!alive) {
-    await addLog(`Step 7: Opening ${mail.label}...`);
-    await chrome.tabs.create({ url: mail.url, active: true });
-  } else {
+  if (alive) {
     const tabId = await getTabId(mail.source);
-    if (tabId) await chrome.tabs.update(tabId, { active: true });
+    await chrome.tabs.update(tabId, { active: true });
+  } else {
+    await reuseOrCreateTab(mail.source, mail.url);
   }
 
   const result = await sendToContentScript(mail.source, {
@@ -835,9 +861,8 @@ async function executeStep8(state) {
             payload: {},
           });
         } else {
-          // Auth tab was closed, reopen OAuth URL
-          await chrome.tabs.create({ url: state.oauthUrl, active: true });
-          await addLog('Step 8: Auth tab closed, reopening OAuth URL...');
+          await reuseOrCreateTab('signup-page', state.oauthUrl);
+          await addLog('Step 8: Auth tab reopened...');
           await sendToContentScript('signup-page', {
             type: 'EXECUTE_STEP',
             step: 8,
@@ -865,31 +890,12 @@ async function executeStep9(state) {
   if (!state.localhostUrl) {
     throw new Error('No localhost URL. Complete step 8 first.');
   }
-
-  const vpsUrl = state.vpsUrl || 'http://154.26.182.181:8317/management.html#/oauth';
-
-  // Switch to VPS panel tab
-  const alive = await isTabAlive('vps-panel');
-  if (!alive) {
-    await addLog('Step 9: Opening VPS panel...');
-    const tab = await chrome.tabs.create({ url: vpsUrl, active: true });
-    await new Promise(resolve => {
-      const listener = (tabId, info) => {
-        if (tabId === tab.id && info.status === 'complete') {
-          chrome.tabs.onUpdated.removeListener(listener);
-          resolve();
-        }
-      };
-      chrome.tabs.onUpdated.addListener(listener);
-    });
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ['content/utils.js', 'content/vps-panel.js'],
-    });
-  } else {
-    const tabId = await getTabId('vps-panel');
-    if (tabId) await chrome.tabs.update(tabId, { active: true });
+  if (!state.vpsUrl) {
+    throw new Error('VPS URL not set. Please enter VPS URL in the side panel.');
   }
+
+  await addLog('Step 9: Opening VPS panel...');
+  await reuseOrCreateTab('vps-panel', state.vpsUrl, { inject: ['content/utils.js', 'content/vps-panel.js'] });
 
   await sendToContentScript('vps-panel', {
     type: 'EXECUTE_STEP',

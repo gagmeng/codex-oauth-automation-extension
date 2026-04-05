@@ -24,6 +24,38 @@ const selectMailProvider = document.getElementById('select-mail-provider');
 const inputRunCount = document.getElementById('input-run-count');
 
 // ============================================================
+// Toast Notifications
+// ============================================================
+
+const toastContainer = document.getElementById('toast-container');
+
+const TOAST_ICONS = {
+  error: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>',
+  warn: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+  success: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+  info: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
+};
+
+function showToast(message, type = 'error', duration = 4000) {
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  toast.innerHTML = `${TOAST_ICONS[type] || ''}<span class="toast-msg">${escapeHtml(message)}</span><button class="toast-close">&times;</button>`;
+
+  toast.querySelector('.toast-close').addEventListener('click', () => dismissToast(toast));
+  toastContainer.appendChild(toast);
+
+  if (duration > 0) {
+    setTimeout(() => dismissToast(toast), duration);
+  }
+}
+
+function dismissToast(toast) {
+  if (!toast.parentNode) return;
+  toast.classList.add('toast-exit');
+  toast.addEventListener('animationend', () => toast.remove());
+}
+
+// ============================================================
 // State Restore on load
 // ============================================================
 
@@ -193,7 +225,7 @@ document.querySelectorAll('.step-btn').forEach(btn => {
     if (step === 3) {
       const email = inputEmail.value.trim();
       if (!email) {
-        appendLog({ message: 'Please paste email address first', level: 'error', timestamp: Date.now() });
+        showToast('Please paste email address first', 'warn');
         return;
       }
       await chrome.runtime.sendMessage({ type: 'EXECUTE_STEP', source: 'sidepanel', payload: { step, email } });
@@ -215,7 +247,7 @@ btnAutoRun.addEventListener('click', async () => {
 btnAutoContinue.addEventListener('click', async () => {
   const email = inputEmail.value.trim();
   if (!email) {
-    appendLog({ message: 'Please paste DuckDuckGo email first!', level: 'error', timestamp: Date.now() });
+    showToast('Please paste DuckDuckGo email first!', 'warn');
     return;
   }
   autoContinueBar.style.display = 'none';
@@ -279,6 +311,9 @@ chrome.runtime.onMessage.addListener((message) => {
   switch (message.type) {
     case 'LOG_ENTRY':
       appendLog(message.payload);
+      if (message.payload.level === 'error') {
+        showToast(message.payload.message, 'error');
+      }
       break;
 
     case 'STEP_STATUS_CHANGED': {

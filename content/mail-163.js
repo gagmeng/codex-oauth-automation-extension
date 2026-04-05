@@ -184,37 +184,49 @@ async function deleteEmail(item, step) {
   try {
     log(`Step ${step}: Deleting email...`);
 
-    // Right-click on the mail item to trigger context menu
-    const rect = item.getBoundingClientRect();
-    item.dispatchEvent(new MouseEvent('contextmenu', {
-      bubbles: true, cancelable: true, button: 2,
-      clientX: rect.left + rect.width / 2,
-      clientY: rect.top + rect.height / 2,
-    }));
+    // Strategy 1: Click the trash icon inside the mail item
+    // Each mail item has: <b class="nui-ico nui-ico-delete" title="删除邮件" sign="trash">
+    // These icons appear on hover, so we trigger mouseover first
+    item.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    item.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+    await sleep(300);
 
-    // Wait for context menu to appear
-    let deleteMenuItem = null;
-    for (let i = 0; i < 10; i++) {
+    const trashIcon = item.querySelector('[sign="trash"], .nui-ico-delete, [title="删除邮件"]');
+    if (trashIcon) {
+      trashIcon.click();
+      log(`Step ${step}: Clicked trash icon`, 'ok');
+      await sleep(1500);
+
+      // Check if item disappeared (confirm deletion)
+      const stillExists = document.getElementById(item.id);
+      if (!stillExists || stillExists.style.display === 'none') {
+        log(`Step ${step}: Email deleted successfully`);
+      } else {
+        log(`Step ${step}: Email may not have been deleted, item still visible`, 'warn');
+      }
+      return;
+    }
+
+    // Strategy 2: Select checkbox then click toolbar delete button
+    log(`Step ${step}: Trash icon not found, trying checkbox + toolbar delete...`);
+    const checkbox = item.querySelector('[sign="checkbox"], .nui-chk');
+    if (checkbox) {
+      checkbox.click();
       await sleep(300);
-      const menuItems = document.querySelectorAll('.nui-menu-item .nui-menu-item-text');
-      for (const mi of menuItems) {
-        if (mi.textContent.trim() === '删除邮件') {
-          deleteMenuItem = mi.closest('.nui-menu-item');
-          break;
+
+      // Click toolbar delete button
+      const toolbarBtns = document.querySelectorAll('.nui-btn .nui-btn-text');
+      for (const btn of toolbarBtns) {
+        if (btn.textContent.replace(/\s/g, '').includes('删除')) {
+          btn.closest('.nui-btn').click();
+          log(`Step ${step}: Clicked toolbar delete`, 'ok');
+          await sleep(1500);
+          return;
         }
       }
-      if (deleteMenuItem) break;
     }
 
-    if (deleteMenuItem) {
-      deleteMenuItem.click();
-      log(`Step ${step}: Clicked "删除邮件"`, 'ok');
-      // Wait for the delete to process and item to disappear
-      await sleep(1000);
-      log(`Step ${step}: Email deleted successfully`);
-    } else {
-      log(`Step ${step}: Context menu "删除邮件" not found`, 'warn');
-    }
+    log(`Step ${step}: Could not delete email (no delete button found)`, 'warn');
   } catch (err) {
     log(`Step ${step}: Failed to delete email: ${err.message}`, 'warn');
   }

@@ -39,7 +39,7 @@ async function step6_loginChatGPT() {
   // Get state for email and password
   const state = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
   const email = state.email;
-  const password = state.password || 'mimashisha0.0';
+  const password = state.password;
 
   if (!email) throw new Error('No email found in state. Complete earlier steps first.');
 
